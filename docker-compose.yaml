@@ -1,5 +1,3 @@
-version: '3.8'
-
 services:
   keycloak_db:
     image: postgres:14
@@ -8,9 +6,12 @@ services:
       POSTGRES_USER: keycloak_user
       POSTGRES_PASSWORD: keycloak_password
     volumes:
-      - ./postgres-keycloak-data:/var/lib/postgresql/data
-    ports:
-      - "5433:5432"
+      - ./postgres-keycloak-data:/var/lib/postgresql/data:Z
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U keycloak_user -d keycloak_db"]
+      interval: 5s
+      retries: 20
+
   keycloak:
     image: quay.io/keycloak/keycloak:21.1
     environment:
@@ -20,23 +21,92 @@ services:
       KC_DB_URL: jdbc:postgresql://keycloak_db:5432/keycloak_db
       KC_DB_USERNAME: keycloak_user
       KC_DB_PASSWORD: keycloak_password
-    command: 
-      - start-dev
-      - --import-realm
+    command: ["start-dev", "--import-realm"]
     volumes:
-      - ./keycloak/realm-export.json:/opt/keycloak/data/import/realm-export.json
+      - ./keycloak/realm-export.json:/opt/keycloak/data/import/realm-export.json:ro,Z
     ports:
-      - "8080:8080"
+      - "127.0.0.1:8080:8080"
     depends_on:
-      - keycloak_db
-  frontend:
-    build:
-      context: ./frontend
-      dockerfile: Dockerfile
-    ports:
-      - "3000:3000"
+      keycloak_db:
+        condition: service_healthy
+
+  source_db:
+    image: postgres:14
     environment:
-      REACT_APP_API_URL: http://localhost:8000
-      REACT_APP_KEYCLOAK_URL: http://localhost:8080
-      REACT_APP_KEYCLOAK_REALM: reports-realm
-      REACT_APP_KEYCLOAK_CLIENT_ID: reports-frontend
+      POSTGRES_DB: crm
+      POSTGRES_USER: source_user
+      POSTGRES_PASSWORD: source_password
+    volumes:
+      - source-data:/var/lib/postgresql/data
+      - ./demo/init.sql:/docker-entrypoint-initdb.d/init.sql:ro,Z
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U source_user -d crm"]
+      interval: 5s
+      retries: 20
+
+  clickhouse:
+    image: clickhouse/clickhouse-server:25.8
+    environment:
+      CLICKHOUSE_DB: bionicpro
+      CLICKHOUSE_USER: etl
+      CLICKHOUSE_PASSWORD: etl_password
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: "1"
+    volumes:
+      - clickhouse-data:/var/lib/clickhouse
+      - ./clickhouse/init.sql:/docker-entrypoint-initdb.d/init.sql:ro,Z
+    healthcheck:
+      test: ["CMD", "clickhouse-client", "--user", "etl", "--password", "etl_password", "--query", "SELECT 1"]
+      interval: 5s
+      retries: 30
+
+  airflow:
+    build: ./airflow
+    command: standalone
+    environment:
+      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+      AIRFLOW__CORE__DAGS_FOLDER: /opt/airflow/dags
+      AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "false"
+      AIRFLOW__CORE__EXECUTOR: SequentialExecutor
+      CRM_DSN: postgresql://source_user:source_password@source_db:5432/crm
+      TELEMETRY_DSN: postgresql://source_user:source_password@source_db:5432/telemetry
+      CLICKHOUSE_HOST: clickhouse
+      CLICKHOUSE_USER: etl
+      CLICKHOUSE_PASSWORD: etl_password
+    volumes:
+      - airflow-data:/opt/airflow/state
+    ports:
+      - "127.0.0.1:8081:8080"
+    depends_on:
+      source_db:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+
+  backend:
+    build: ./backend
+    environment:
+      KEYCLOAK_ISSUER: http://localhost:8080/realms/reports-realm
+      KEYCLOAK_JWKS_URL: http://keycloak:8080/realms/reports-realm/protocol/openid-connect/certs
+      CLICKHOUSE_HOST: clickhouse
+      CLICKHOUSE_USER: report_reader
+      CLICKHOUSE_PASSWORD: report_password
+      FRONTEND_URL: http://localhost:3000
+    ports:
+      - "127.0.0.1:8000:8000"
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+      keycloak:
+        condition: service_started
+
+  frontend:
+    build: ./frontend
+    ports:
+      - "127.0.0.1:3000:3000"
+    depends_on:
+      - backend
+
+volumes:
+  source-data:
+  clickhouse-data:
+  airflow-data:
